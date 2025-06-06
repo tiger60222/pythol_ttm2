@@ -1,33 +1,158 @@
+import os
+import re
 import requests
+import pandas as pd
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+from duckduckgo_search import DDGS
+from googlesearch import search
+from tkinter import filedialog
+import pytesseract
+from PIL import Image
+import zipfile
+import rarfile
+import fitz  # PyMuPDF
+import textract
+import tempfile
 
-# Từ khóa tìm kiếm
-search_keyword = "danh sách học sinh"
+# Từ khoá tìm kiếm chính
+KEYWORDS = [
+    "danh sách học sinh", "tuyển sinh lớp 1", "tra cứu học sinh",
+    "kết quả tuyển sinh", "nộp hồ sơ lớp 6"
+]
 
-# URL tìm kiếm của Violet
-search_url = "https://violet.vn/site/search"
+# Biểu thức nhận dạng SĐT
+PHONE_PATTERN = re.compile(r'(0|\+84)[\s\.\-]?\d{2,3}[\s\.\-]?\d{3}[\s\.\-]?\d{3,4}')
 
-# Thực hiện truy vấn tìm kiếm
-params = {
-    "q": search_keyword,
-    "search_type": "doc"  # Tìm kiếm tài liệu
-}
+# Tạo thư mục tạm lưu kết quả
+output_folder = filedialog.askdirectory(title="Chọn thư mục lưu kết quả")
+os.makedirs(output_folder, exist_ok=True)
 
-headers = {
-    "User-Agent": "Mozilla/5.0"
-}
+# Hàm tìm kiếm URL theo địa chỉ
+def search_links(location_keyword):
+    combined_keywords = [f"{kw} {location_keyword}" for kw in KEYWORDS]
+    links = set()
+    for kw in combined_keywords:
+        print(f"🔍 Tìm kiếm: {kw}")
+        # Google
+        try:
+            for url in search(kw, num_results=5):
+                links.add(url)
+        except:
+            pass
+        # DuckDuckGo
+        try:
+            with DDGS() as ddgs:
+                results = ddgs.text(kw, max_results=5)
+                for r in results:
+                    links.add(r.get("href", ""))
+        except:
+            pass
+    return list(links)
 
-response = requests.get(search_url, params=params, headers=headers)
+# Tải file về
+def download_file(url, save_dir):
+    local_filename = os.path.join(save_dir, url.split("/")[-1])
+    try:
+        with requests.get(url, stream=True, timeout=10) as r:
+            r.raise_for_status()
+            with open(local_filename, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        return local_filename
+    except:
+        return None
 
-# Phân tích HTML
-soup = BeautifulSoup(response.text, "html.parser")
+# Trích xuất nội dung từ file
+def extract_text(filepath):
+    try:
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext in ['.pdf']:
+            text = ""
+            doc = fitz.open(filepath)
+            for page in doc:
+                text += page.get_text()
+            return text
+        elif ext in ['.docx', '.txt']:
+            return textract.process(filepath).decode("utf-8")
+        elif ext in ['.xlsx', '.xls', '.csv']:
+            df = pd.read_excel(filepath) if ext != '.csv' else pd.read_csv(filepath)
+            return "\n".join(df.astype(str).fillna("").values.ravel())
+        elif ext in ['.jpg', '.png']:
+            return pytesseract.image_to_string(Image.open(filepath))
+        elif ext in ['.zip']:
+            return extract_from_zip(filepath)
+        elif ext in ['.rar']:
+            return extract_from_rar(filepath)
+    except:
+        return ""
 
-# Tìm các kết quả tìm kiếm
-results = soup.find_all("div", class_="doc-item")
+# Giải nén zip
+def extract_from_zip(zip_path):
+    temp_dir = tempfile.mkdtemp()
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(temp_dir)
+    return "\n".join([extract_text(os.path.join(temp_dir, f)) for f in os.listdir(temp_dir)])
 
-for idx, item in enumerate(results, 1):
-    title_tag = item.find("a", class_="doc-title")
-    if title_tag:
-        title = title_tag.text.strip()
-        link = "https://violet.vn" + title_tag["href"]
-        print(f"{idx}. {title}\n   {link}\n")
+# Giải nén rar
+def extract_from_rar(rar_path):
+    temp_dir = tempfile.mkdtemp()
+    with rarfile.RarFile(rar_path) as rf:
+        rf.extractall(temp_dir)
+    return "\n".join([extract_text(os.path.join(temp_dir, f)) for f in os.listdir(temp_dir)])
+
+# Trích xuất dòng có chứa số điện thoại
+def extract_valid_lines(text):
+    lines = []
+    for line in text.split('\n'):
+        if PHONE_PATTERN.search(line):
+            lines.append(line.strip())
+    return lines
+
+# Xử lý từng URL
+def process_link(url, output_excel_path):
+    print(f"⚙️ Đang xử lý: {url}")
+    try:
+        r = requests.get(url, timeout=10)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        attachments = soup.find_all('a', href=True)
+        lines = []
+
+        for a in attachments:
+            href = a['href']
+            full_url = urljoin(url, href)
+            if any(href.lower().endswith(ext) for ext in ['.pdf', '.docx', '.xlsx', '.xls', '.csv', '.txt', '.jpg', '.png', '.zip', '.rar']):
+                filepath = download_file(full_url, output_folder)
+                if filepath:
+                    text = extract_text(filepath)
+                    lines.extend(extract_valid_lines(text))
+
+        # Nếu không có tệp => đọc nội dung HTML
+        if not lines:
+            html_text = soup.get_text()
+            lines = extract_valid_lines(html_text)
+
+        # Tạo bảng dữ liệu
+        data = []
+        for i, line in enumerate(lines, 1):
+            phone = PHONE_PATTERN.search(line)
+            data.append([i, "Đang xử lý", "", "", phone.group() if phone else ""])
+
+        # Xuất ra Excel
+        df = pd.DataFrame(data, columns=["STT", "HỌ TÊN", "NĂM SINH", "HỌ TÊN CHA/MẸ", "SỐ ĐIỆN THOẠI CHA/MẸ"])
+        df.to_excel(output_excel_path, index=False)
+        print(f"✅ Đã lưu: {output_excel_path}")
+    except Exception as e:
+        print(f"❌ Lỗi: {e}")
+
+# MAIN: hỏi từ khoá người dùng và bắt đầu xử lý
+if __name__ == "__main__":
+    location = input("Nhập từ khoá địa chỉ (ví dụ: TP Bà Rịa): ").strip()
+    links = search_links(location)
+    print(f"🔗 Tìm thấy {len(links)} liên kết")
+
+    for idx, link in enumerate(links):
+        output_path = os.path.join(output_folder, f"OUTPUT_EXCEL_{idx+1}.xlsx")
+        process_link(link, output_path)
+
+    print("🎯 Hoàn tất thu thập.")
